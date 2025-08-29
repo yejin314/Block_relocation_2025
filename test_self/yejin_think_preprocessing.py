@@ -1,28 +1,21 @@
 from collections import deque
 from copy import deepcopy
 
+# --- 기본 설정 및 헬퍼 함수 ---
 GRID_ROWS = 4
 GRID_COLS = 5
 
-yellow_block = {'row1': 1, 'col1': 1, 'row2': 2, 'col2': 1}  # 이동 블록
-
-# 방해 블록
+yellow_block = {'row1': 1, 'col1': 0, 'row2': 2, 'col2': 1}
 gray_blocks = [
-    {'row1': 2, 'col1': 2, 'row2': 2, 'col2': 2}
+    {'row1': 1, 'col1': 2, 'row2': 2, 'col2': 2}
 ]
 
-directions = [(-1,0,"up"), (1,0,"down"), (0,-1,"left"), (0,1,"right")]
+directions = [(-1, 0, "up"), (1, 0, "down"), (0, -1, "left"), (0, 1, "right")]
 
-# -------- 유틸 함수 --------
+
+# --- 가상 영역 생성 함수 (다시 추가) ---
 def get_virtual_horizontal(block):
-    return {
-        'row1': block['row1'],
-        'col1': max(0, block['col1'] - 1),
-        'row2': block['row2'],
-        'col2': min(GRID_COLS - 1, block['col2'] + 1)
-    }
-
-def get_virtual_vertical(block):
+    # 블록의 위아래 한 칸씩을 포함하는 가로로 긴 가상 영역을 반환
     return {
         'row1': max(0, block['row1'] - 1),
         'col1': block['col1'],
@@ -30,177 +23,142 @@ def get_virtual_vertical(block):
         'col2': block['col2']
     }
 
+
+def get_virtual_vertical(block):
+    # 블록의 좌우 한 칸씩을 포함하는 세로로 긴 가상 영역을 반환
+    return {
+        'row1': block['row1'],
+        'col1': max(0, block['col1'] - 1),
+        'row2': block['row2'],
+        'col2': min(GRID_COLS - 1, block['col2'] + 1)
+    }
+
+
 def is_overlap(a, b):
     return not (
-        a['col2'] < b['col1'] or a['col1'] > b['col2'] or
-        a['row2'] < b['row1'] or a['row1'] > b['row2']
+            a['col2'] < b['col1'] or a['col1'] > b['col2'] or
+            a['row2'] < b['row1'] or a['row1'] > b['row2']
     )
+
 
 def is_in_bounds(block):
     return (0 <= block['row1'] <= block['row2'] < GRID_ROWS and
             0 <= block['col1'] <= block['col2'] < GRID_COLS)
 
+
 def build_occupancy(blocks):
     occupied = set()
     for blk in blocks:
-        for r in range(blk['row1'], blk['row2']+1):
-            for c in range(blk['col1'], blk['col2']+1):
+        for r in range(blk['row1'], blk['row2'] + 1):
+            for c in range(blk['col1'], blk['col2'] + 1):
                 occupied.add((r, c))
     return occupied
 
+
 def block_moved(block, dr, dc):
-    return {'row1': block['row1'] + dr,
-            'col1': block['col1'] + dc,
-            'row2': block['row2'] + dr,
-            'col2': block['col2'] + dc}
+    return {'row1': block['row1'] + dr, 'col1': block['col1'] + dc,
+            'row2': block['row2'] + dr, 'col2': block['col2'] + dc}
 
-def blocks_to_cells(block):
-    return [(r, c) for r in range(block['row1'], block['row2']+1)
-                   for c in range(block['col1'], block['col2']+1)]
 
-# -------- 재배치 경로 가능 여부 --------
-def can_move_block(start_block, target_block, other_blocks):
-    visited = set()
-    queue = deque([start_block])
-    occupied = build_occupancy(other_blocks)
+def blocks_to_tuple(blocks):
+    return tuple(sorted((b['row1'], b['col1'], b['row2'], b['col2']) for b in blocks))
+
+
+def find_relocation_path(block_to_move, space_to_clear, static_obstacles):
+    queue = deque([(block_to_move, 0)])
+    visited = set([(block_to_move['row1'], block_to_move['col1'])])
+    occupied_by_static = build_occupancy(static_obstacles)
+
     while queue:
-        cur = queue.popleft()
-        if (cur['row1'], cur['col1']) == (target_block['row1'], target_block['col1']):
-            return True
-        if (cur['row1'], cur['col1']) in visited:
-            continue
-        visited.add((cur['row1'], cur['col1']))
+        current_block, moves = queue.popleft()
+        if not is_overlap(current_block, space_to_clear):
+            return current_block, moves
+
         for dr, dc, _ in directions:
-            nxt = block_moved(cur, dr, dc)
-            if not is_in_bounds(nxt):
+            next_block = block_moved(current_block, dr, dc)
+            if not is_in_bounds(next_block):
                 continue
-            nxt_cells = blocks_to_cells(nxt)
-            if any(cell in occupied for cell in nxt_cells):
+            if (next_block['row1'], next_block['col1']) in visited:
                 continue
-            queue.append(nxt)
-    return False
 
-# -------- 재배치 위치 찾기 (이동 블록 주변 제한 반경 내 탐색) --------
-def find_relocation_position(block, occupied_cells, vh, vv, other_blocks, max_distance=2):
-    h = block['row2'] - block['row1'] + 1
-    w = block['col2'] - block['col1'] + 1
-
-    # 이동 블록 현재 위치 중앙 좌표 기준
-    block_center_r = (vh['row1'] + vh['row2']) // 2
-    block_center_c = (vv['col1'] + vv['col2']) // 2
-
-    candidates = []
-    for r in range(max(0, block_center_r - max_distance), min(GRID_ROWS - h + 1, block_center_r + max_distance + 1)):
-        for c in range(max(0, block_center_c - max_distance), min(GRID_COLS - w + 1, block_center_c + max_distance + 1)):
-            candidate = {'row1': r, 'col1': c, 'row2': r + h - 1, 'col2': c + w - 1}
-            if is_overlap(candidate, vh) or is_overlap(candidate, vv):
+            next_occupied = build_occupancy([next_block])
+            if not next_occupied.isdisjoint(occupied_by_static):
                 continue
-            cells = blocks_to_cells(candidate)
-            if any(cell in occupied_cells for cell in cells):
-                continue
-            if can_move_block(block, candidate, other_blocks):
-                candidates.append(candidate)
 
-    if candidates:
-        candidates.sort(key=lambda x: abs(x['row1'] - block_center_r) + abs(x['col1'] - block_center_c))
-        return candidates[0]
+            visited.add((next_block['row1'], next_block['col1']))
+            queue.append((next_block, moves + 1))
+
     return None
 
-# -------- BFS: 재배치 없이 --------
-def bfs_avoid_obstacles(yellow, gray_blocks):
-    queue = deque()
-    visited = set()
-    queue.append((yellow, []))
-    gray_occupy = build_occupancy(gray_blocks)
+
+def solve_puzzle(yellow_start, gray_start):
+    initial_state = (yellow_start, gray_start, 0, [], [])
+    queue = deque([initial_state])
+    visited = set([((yellow_start['row1'], yellow_start['col1']), blocks_to_tuple(gray_start))])
+
     while queue:
-        block, path = queue.popleft()
-        pos = (block['row1'], block['col1'])
-        if pos in visited:
-            continue
-        visited.add(pos)
-        new_path = path + [pos]
-        if block['col2'] == GRID_COLS - 1:
-            return new_path
-        for dr, dc, _ in directions:
-            nxt = block_moved(block, dr, dc)
-            if not is_in_bounds(nxt):
-                continue
-            nxt_cells = blocks_to_cells(nxt)
-            if any(cell in gray_occupy for cell in nxt_cells):
-                continue
-            queue.append((nxt, new_path))
-    return None
+        y_block, g_blocks, cost, path, log = queue.popleft()
+        new_path = path + [(y_block['row1'], y_block['col1'])]
+        if y_block['col2'] == GRID_COLS - 1:
+            return new_path, cost, log
 
-# -------- BFS: 재배치 포함 --------
-def bfs_with_relocation(yellow, gray_blocks):
-    queue = deque()
-    visited = set()
-    queue.append((yellow, deepcopy(gray_blocks), 0, [], []))
-    while queue:
-        cur_block, curr_grays, reloc_cnt, path, reloc_log = queue.popleft()
-        pos = (cur_block['row1'], cur_block['col1'])
-        key = (pos, tuple((g['row1'], g['col1'], g['row2'], g['col2']) for g in curr_grays))
-        if key in visited:
-            continue
-        visited.add(key)
-        new_path = path + [pos]
-        if cur_block['col2'] == GRID_COLS - 1:
-            return new_path, reloc_cnt, reloc_log
+        # --- 가상 영역 로직 적용 부분 ---
+        vh = get_virtual_horizontal(y_block)  # 가로 가상 영역
+        vv = get_virtual_vertical(y_block)  # 세로 가상 영역
 
-        vh = get_virtual_horizontal(cur_block)
-        vv = get_virtual_vertical(cur_block)
+        for dr, dc, move_dir in directions:
+            next_y_block = block_moved(y_block, dr, dc)
 
-        for dr, dc, _ in directions:
-            nxt_block = block_moved(cur_block, dr, dc)
-            if not is_in_bounds(nxt_block):
-                continue
-            if not (is_overlap(nxt_block, vh) or is_overlap(nxt_block, vv)):
+            if not is_in_bounds(next_y_block):
                 continue
 
-            occupied_cells = build_occupancy(curr_grays)
-            blocked, block_idx = False, None
-            for idx, g in enumerate(curr_grays):
-                if is_overlap(nxt_block, g):
-                    blocked, block_idx = True, idx
+            # 다음 이동 위치가 가상 영역 내에 있는지 확인
+            if not (is_overlap(next_y_block, vh) or is_overlap(next_y_block, vv)):
+                continue  # 가상 영역 밖의 움직임은 고려하지 않음
+            # --- 로직 적용 끝 ---
+
+            colliding_gray_idx = -1
+            for i, g_block in enumerate(g_blocks):
+                if is_overlap(next_y_block, g_block):
+                    colliding_gray_idx = i
                     break
 
-            if blocked:
-                gray_to_move = curr_grays[block_idx]
-                occ_wo_this = build_occupancy([g for i, g in enumerate(curr_grays) if i != block_idx])
-                new_grays = deepcopy(curr_grays)
-                new_vh = get_virtual_horizontal(nxt_block)
-                new_vv = get_virtual_vertical(nxt_block)
-                other_blocks = [g for i, g in enumerate(curr_grays) if i != block_idx] + [nxt_block]
-                new_pos = find_relocation_position(gray_to_move, occ_wo_this, new_vh, new_vv, other_blocks, max_distance=2)
-                if new_pos:
-                    new_grays[block_idx] = new_pos
-                    log = reloc_log + [((gray_to_move['row1'], gray_to_move['col1']), (new_pos['row1'], new_pos['col1']))]
-                    queue.append((nxt_block, new_grays, reloc_cnt+1, new_path, log))
-                else:
-                    # 후보 위치 없으면 장애물 제거
-                    remove_grays = deepcopy(curr_grays)
-                    removed_block = remove_grays.pop(block_idx)
-                    log = reloc_log + [((removed_block['row1'], removed_block['col1']), "REMOVED")]
-                    queue.append((nxt_block, remove_grays, reloc_cnt+2, new_path, log))
+            if colliding_gray_idx == -1:
+                state_key = ((next_y_block['row1'], next_y_block['col1']), blocks_to_tuple(g_blocks))
+                if state_key not in visited:
+                    visited.add(state_key)
+                    queue.append((next_y_block, deepcopy(g_blocks), cost + 0.001, new_path, log))
             else:
-                queue.append((nxt_block, deepcopy(curr_grays), reloc_cnt, new_path, reloc_log))
+                block_to_move = g_blocks[colliding_gray_idx]
+                static_obstacles = [y_block] + [g for i, g in enumerate(g_blocks) if i != colliding_gray_idx]
+                relocation_result = find_relocation_path(block_to_move, next_y_block, static_obstacles)
+
+                if relocation_result:
+                    new_g_pos, num_moves = relocation_result
+                    next_g_blocks = deepcopy(g_blocks)
+                    next_g_blocks[colliding_gray_idx] = new_g_pos
+                    state_key = ((next_y_block['row1'], next_y_block['col1']), blocks_to_tuple(next_g_blocks))
+                    if state_key not in visited:
+                        visited.add(state_key)
+                        new_log = log + [{'from': (block_to_move['row1'], block_to_move['col1']),
+                                          'to': (new_g_pos['row1'], new_g_pos['col1']), 'moves': num_moves}]
+                        new_cost = cost + 0.001 + (num_moves * 1.0)
+                        queue.append((next_y_block, next_g_blocks, new_cost, new_path, new_log))
+
     return None, None, None
 
-# ---- 실행 ----
+
 if __name__ == "__main__":
-    path_no_reloc = bfs_avoid_obstacles(yellow_block, gray_blocks)
-    if path_no_reloc:
-        print("방해 블록을 피하는 경로:")
-        print(path_no_reloc)
-        print("재배치 없이 반출 가능")
-        print('reward:', 0 - 0.001 * (len(path_no_reloc) - 1))
+    final_path, total_cost, relocations = solve_puzzle(yellow_block, gray_blocks)
+    if final_path:
+        print("✅ 반출 가능 경로를 찾았습니다!")
+        print("-" * 30)
+        print(f"노란 블록 이동 경로: {final_path}")
+        print(f"총 재배치 횟수: {len(relocations)} 회")
+        print("재배치 상세 이력:")
+        for r in relocations:
+            print(f"  - 블록 {r['from']} -> {r['to']} ({r['moves']}칸 이동)")
+        print("-" * 30)
+        print(f"최종 비용 (Reward: {-total_cost:.4f})")
     else:
-        print("재배치 포함 경로 탐색...")
-        path_reloc, reloc_count, reloc_log = bfs_with_relocation(yellow_block, gray_blocks)
-        if path_reloc:
-            print("최종 경로:", path_reloc)
-            print("총 재배치 횟수:", reloc_count)
-            print("재배치 이력:", reloc_log)
-            print('reward:', 0 - 0.001 * (len(path_reloc) - 1) - reloc_count)
-        else:
-            print("반출 불가")
+        print("❌ 반출 가능한 경로를 찾을 수 없습니다.")
