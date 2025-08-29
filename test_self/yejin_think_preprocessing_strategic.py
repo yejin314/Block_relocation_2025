@@ -3,27 +3,14 @@ from collections import deque
 from copy import deepcopy
 
 # --- 기본 설정 및 헬퍼 함수 (이전과 동일) ---
-GRID_ROWS = 10
-GRID_COLS = 11
+GRID_ROWS = 4
+GRID_COLS = 5
 
-yellow_block = {'row1': 4, 'col1': 2, 'row2': 5, 'col2': 4}  # 이동 블록
-
-# 방해 블록
+yellow_block = {'row1': 1, 'col1': 0, 'row2': 2, 'col2': 1}
 gray_blocks = [
-    # 맨 왼쪽 세로줄(위에서 아래로 연속)
-    {'row1': 1, 'col1': 1, 'row2': 2, 'col2': 3},    # (0,2)-(2,2)
-    # # (2,3)만 단독
-    # {'row1': 2, 'col1': 3, 'row2': 2, 'col2': 3},
-    # # 윗쪽 가로줄 (2행, 4~4)
-    # {'row1': 2, 'col1': 4, 'row2': 2, 'col2': 4},
-    # 중앙(3,4)-(4,4) 가로 연속 2칸
-    {'row1': 6, 'col1': 4, 'row2': 9, 'col2': 5},
-    # 세로줄 (5,3)-(6,3)
-    # {'row1': 5, 'col1': 3, 'row2': 6, 'col2': 3},
-    # 오른쪽 가로줄 (3,5)-(4,5)
-    {'row1': 3, 'col1': 5, 'row2': 4, 'col2': 6}
-]
+    {'row1': 1, 'col1': 2, 'row2': 2, 'col2': 2},
 
+]
 directions = [(-1, 0, "up"), (1, 0, "down"), (0, -1, "left"), (0, 1, "right")]
 
 

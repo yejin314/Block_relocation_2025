@@ -38,7 +38,7 @@ class ActorCritic(nn.Module):
 
 def compute_gae_and_returns(rewards, masks, values, last_value, gamma=0.99, lam=0.95):
     values = values + [last_value]
-    gae = 0
+    gae = 0;
     returns = []
     for step in reversed(range(len(rewards))):
         delta = rewards[step] + gamma * values[step + 1] * masks[step] - values[step]
@@ -56,17 +56,18 @@ def train_ppo_stable(env, model, optimizer, num_total_steps=50000,
 
     model.to(device)
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
-    all_rewards, all_losses, all_relocations = [], [], []
+    all_rewards, all_losses, all_relocations, all_success_rates = [], [], [], []
 
     recent_rewards = deque(maxlen=20)
-    recent_relocations = deque(maxlen=20)
-    recent_successes = deque(maxlen=100)
+    recent_successes = deque(maxlen=100)  # 최근 100개 에피소드의 성공 여부 기록
 
     episode_rewards, episode_num, episode_len = [], 0, 0
     state = env.reset()
 
     for global_step in range(0, num_total_steps, rollout_length):
         success_rate = (np.mean(recent_successes) * 100) if recent_successes else 0
+        all_success_rates.append(success_rate)  # 그래프를 위해 성공률 저장
+
         print(
             f"[진행] Step {global_step}/{num_total_steps} | "
             f"최근 평균 보상: {np.mean(recent_rewards):.3f} | "
@@ -74,7 +75,6 @@ def train_ppo_stable(env, model, optimizer, num_total_steps=50000,
             f"최신 Loss: {all_losses[-1] if all_losses else 'N/A'}",
             flush=True
         )
-
         states, actions, log_probs, values, rewards, masks, old_values = [], [], [], [], [], [], []
 
         for step in range(rollout_length):
@@ -85,31 +85,28 @@ def train_ppo_stable(env, model, optimizer, num_total_steps=50000,
                 action = dist.sample()
 
             next_state, reward, done, info = env.step(action.item())
-
-            episode_rewards.append(reward)
+            episode_rewards.append(reward);
             episode_len += 1
-
             states.append(state_t);
             actions.append(action);
             log_probs.append(dist.log_prob(action))
             values.append(value.item());
             rewards.append(reward);
-            masks.append(1 - int(done))
+            masks.append(1 - int(done));
             old_values.append(value)
-
             state = next_state
+
             if done:
                 total_reward = sum(episode_rewards)
                 all_rewards.append(total_reward)
                 recent_rewards.append(total_reward)
                 all_relocations.append(env.num_relocations)
-                recent_relocations.append(env.num_relocations)
 
-                # 새로운 환경은 info를 반환하지 않으므로, 성공 여부를 보상 기반으로 추정
-                if episode_len < 100:  # 성공 보상이 양수일 경우
+                # ✨ [수정] info 딕셔너리를 사용하여 성공 여부 판단
+                if info.get('success', False):
                     termination_log = "성공 (Success)"
                     recent_successes.append(1)
-                else:  # 타임아웃 또는 실패
+                else:
                     termination_log = "실패/타임아웃"
                     recent_successes.append(0)
 
@@ -122,119 +119,102 @@ def train_ppo_stable(env, model, optimizer, num_total_steps=50000,
                 state = env.reset()
 
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device == "cuda")):
-            last_state_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-            _, last_value_tensor = model(last_state_t)
+            _, last_value_tensor = model(
+                last_state_t := torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0))
             last_value = last_value_tensor.item()
 
         returns = compute_gae_and_returns(rewards, masks, values, last_value, gamma, lam)
         states, actions, old_log_probs = torch.cat(states), torch.stack(actions), torch.stack(log_probs).detach()
         old_values, returns = torch.cat(old_values).detach(), torch.tensor(returns, dtype=torch.float32, device=device)
-
-        advantages = returns - old_values.squeeze(-1)
+        advantages = (returns - old_values.squeeze(-1));
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         rollout_losses = []
         for _ in range(K_epochs):
-            idxs = torch.randperm(rollout_length)
-            for start_idx in range(0, rollout_length, batch_size):
-                end_idx = start_idx + batch_size
-                mb_idx = idxs[start_idx:end_idx]
-
+            for mb_idx in torch.randperm(rollout_length).chunk(rollout_length // batch_size):
                 with torch.cuda.amp.autocast(enabled=(device == "cuda")):
                     logits, value = model(states[mb_idx])
                     dist = Categorical(logits=logits)
                     new_log_probs, entropy = dist.log_prob(actions[mb_idx]), dist.entropy().mean()
-
                     ratio = (new_log_probs - old_log_probs[mb_idx]).exp()
-                    surr1 = ratio * advantages[mb_idx]
+                    surr1 = ratio * advantages[mb_idx];
                     surr2 = torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * advantages[mb_idx]
                     policy_loss = -torch.min(surr1, surr2).mean()
-
                     value = value.squeeze(-1)
                     value_clipped = old_values[mb_idx].squeeze(-1) + torch.clamp(value - old_values[mb_idx].squeeze(-1),
                                                                                  -value_clip_coef, value_clip_coef)
-                    loss_v_clipped = (value_clipped - returns[mb_idx]).pow(2)
+                    loss_v_clipped = (value_clipped - returns[mb_idx]).pow(2);
                     loss_v_unclipped = (value - returns[mb_idx]).pow(2)
                     value_loss = 0.5 * torch.max(loss_v_clipped, loss_v_unclipped).mean()
-
                     loss = policy_loss + value_loss - entropy_coef * entropy
-
-                rollout_losses.append(loss.item())
+                rollout_losses.append(loss.item());
                 optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # ✨ [수정] 안정성을 위해 grad clip 값 조정
-                scaler.step(optimizer)
+                scaler.scale(loss).backward();
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                scaler.step(optimizer);
                 scaler.update()
-
         all_losses.append(np.mean(rollout_losses))
-    return model, all_rewards, all_losses, all_relocations
+
+    return model, all_rewards, all_losses, all_relocations, all_success_rates
 
 
 # === 실행 ===
 if __name__ == '__main__':
-    # ✨ max_steps는 환경에 맞게 조정 필요
     env = GridEnv(grid_rows=4, grid_cols=5)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"--- 환경 설정 ---\n사용 장치: {device}", flush=True)
 
     model = ActorCritic(env.observation_space.shape, env.action_space.n).to(device)
-    # ✨ [수정] 학습률(lr)을 안정적인 값으로 조정
+    # ✨ [수정] PPO에서 일반적으로 사용되는 안정적인 학습률로 조정
     optimizer = optim.Adam(model.parameters(), lr=0.003)
 
-    model, all_rewards, all_losses, all_relocations = train_ppo_stable(
-        env, model, optimizer,
-        num_total_steps=100000,
-        rollout_length=512,
-        batch_size=64,
-        # ✨ [수정] 정책 업데이트 안정성을 위한 eps_clip 조정
-        eps_clip=0.2,
-        # ✨ [수정] 데이터 활용도를 높이기 위해 K_epochs 조정
-        K_epochs=3,
-        entropy_coef=0.01,
-        device=device
+    model, all_rewards, all_losses, all_relocations, all_success_rates = train_ppo_stable(
+        env, model, optimizer, num_total_steps=70000, rollout_length=128,
+        batch_size=64, K_epochs=3, device=device, eps_clip=0.2, gamma=1.0,
     )
 
-    file_path = './results/'
+    file_path = './results/';
     os.makedirs(file_path, exist_ok=True)
 
-    # --- 그래프 그리기 (2개의 그래프) ---
-    # 1. 보상과 손실 그래프
-    fig, ax1 = plt.subplots(figsize=(12, 5))
-    ax1.set_xlabel('Episode')
-    ax1.set_ylabel('Total Reward', color='tab:blue')
-    ax1.plot(all_rewards, color='tab:blue', label='Reward')
-    ax1.tick_params(axis='y', labelcolor='tab:blue')
-    ax1.grid(True)
-    ax2 = ax1.twinx()
-    ax2.set_ylabel('Loss', color='tab:red')
-    ax2.plot(all_losses, color='tab:red', alpha=0.6, label='Loss')
-    ax2.tick_params(axis='y', labelcolor='tab:red')
-    fig.tight_layout()
-    plt.title('PPO Training Rewards & Loss')
-    reward_loss_path = os.path.join(file_path, f'PPO_Rewards_Loss_2.png')
-    plt.savefig(reward_loss_path)
-    plt.show()
+    # --- 그래프 그리기 (3개의 그래프) ---
+    fig, axes = plt.subplots(3, 1, figsize=(12, 15))
+    fig.tight_layout(pad=5.0)
 
-    # ✨ [추가] 2. 재배치 횟수 그래프
-    plt.figure(figsize=(12, 5))
-    plt.plot(all_relocations, color='tab:green')
-    plt.title('Number of Relocations per Episode')
-    plt.xlabel('Episode')
-    plt.ylabel('Relocation Count')
-    plt.grid(True)
-    relocations_path = os.path.join(file_path, f'PPO_Relocations_2.png')
-    plt.savefig(relocations_path)
+    # 1. 보상 그래프
+    axes[0].plot(pd.Series(all_rewards).rolling(20).mean(), label='Smoothed Reward')
+    axes[0].set_title('PPO Training Rewards (Smoothed)');
+    axes[0].set_xlabel('Episode');
+    axes[0].set_ylabel('Total Reward');
+    axes[0].grid(True)
+
+    # 2. 성공률 그래프
+    axes[1].plot(all_success_rates, color='tab:orange', label='Success Rate')
+    axes[1].set_title('Episode Success Rate (%)');
+    axes[1].set_xlabel('Rollout Step');
+    axes[1].set_ylabel('Success Rate (%)');
+    axes[1].grid(True)
+
+    # 3. 재배치 횟수 그래프
+    axes[2].plot(pd.Series(all_relocations).rolling(20).mean(), color='tab:green', label='Smoothed Relocations')
+    axes[2].set_title('Number of Relocations per Episode (Smoothed)');
+    axes[2].set_xlabel('Episode');
+    axes[2].set_ylabel('Relocation Count');
+    axes[2].grid(True)
+
+    plt.savefig(os.path.join(file_path, f'PPO_Training_Metrics_2.png'));
     plt.show()
 
     # === 평가 모드 ===
     state = env.reset()
     done = False
-    while not done:
+    for _ in range(100):  # 최대 100 스텝까지 평가
         env.render()
-        time.sleep(0.1)
+        time.sleep(0.2)
         with torch.no_grad():
             state_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
             logits, _ = model(state_t)
             action = torch.argmax(logits, dim=-1)
         state, _, done, _ = env.step(action.item())
+        if done: break
     print("Evaluation Finished.", flush=True)
+    env.close()
